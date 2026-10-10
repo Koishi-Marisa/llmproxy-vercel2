@@ -9,6 +9,7 @@ env/
 # Local verification harness (contains a machine-specific proxy bypass)
 verify_proxy.py
 run_local_proxy_test.py
+probe_*.py
 mock_gemini_last_request.json
 
 # Secrets
