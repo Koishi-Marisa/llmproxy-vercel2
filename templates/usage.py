@@ -37,6 +37,10 @@ USAGE = """<!DOCTYPE html>
             text-decoration: underline;
         }
     </style>
+    <script>
+        window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+    </script>
+    <script defer src="https://cdn.vercel-insights.com/v1/script.js"></script>
 </head>
 <body>
     <div class="container">
