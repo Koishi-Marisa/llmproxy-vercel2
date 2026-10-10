@@ -10,7 +10,7 @@ router = APIRouter()
 PLATFORM_API_URLS: Dict[str, str] = {
     "openai": "https://api.openai.com/v1/chat/completions",
     "mistral": "https://api.mistral.ai/v1/chat/completions",
-    "groq": "https://api.groq.com/openai/v1/chat/completions",
+    "groq": "https://api.groq.com/openai/v1",
     "cerebras": "https://api.cerebras.ai/v1/chat/completions",
     "nvidia": "https://integrate.api.nvidia.com/v1/chat/completions",
     "sambanova": "https://api.sambanova.ai/v1/chat/completions",
