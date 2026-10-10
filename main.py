@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from public.usage import USAGE as html
+from templates.usage import USAGE as html
 from api.hello import router as hello_router
 from fastapi import FastAPI
 from fastapi.responses import Response
