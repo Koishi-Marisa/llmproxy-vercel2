@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 import typing
 from typing import List, Dict, Optional
-from .base import Message
+from .base import Message, parse_api_key
 import time
 import json
 import re
@@ -127,13 +127,21 @@ async def stream_gemini_response(model: str, payload: dict, api_key: str):
 @router.post("/chat/completions")
 async def proxy_chat_completions(
     args: OpenAIProxyArgs,
-    authorization: str = Header(...),
+    authorization: str = Header(None),
+    x_api_key: str = Header(None, alias="x-api-key"),
 ):
-    api_key = authorization.split(" ")[1]
-    model = args.model
+    # `authorization.split(" ")[1]` used to raise IndexError -> HTTP 500 for
+    # any header without a space (e.g. a bare token or "Basic ...").
+    try:
+        api_key = parse_api_key(authorization, x_api_key)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=f"{exc}. Send 'Authorization: Bearer <your gemini api key>'.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    if not api_key:
-        raise HTTPException(status_code=400, detail="API key not provided")
+    model = args.model
 
     # Transform args into Gemini API format
     gemini_payload = {
