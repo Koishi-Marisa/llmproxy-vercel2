@@ -167,6 +167,25 @@ def main():
 
     check("input_audio -> inline_data audio/wav", t_audio)
 
+    def t_audio_garbage_rejected():
+        """`b64decode(..., validate=False)` would silently return b'' here."""
+        r = post(body(model="echo-image", messages=[{"role": "user", "content": [
+            {"type": "text", "text": "transcribe"},
+            {"type": "input_audio", "input_audio": {"data": "!!!!not base64!!!!", "format": "wav"}},
+        ]}]))
+        assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text[:200]}"
+        assert "base64" in r.text, r.text[:200]
+
+    check("garbage input_audio -> 400, not an empty part", t_audio_garbage_rejected)
+
+    def t_data_uri_garbage_rejected():
+        r = post(body(model="echo-image", messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,!!!!"}},
+        ]}]))
+        assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text[:200]}"
+
+    check("garbage base64 data URI -> 400", t_data_uri_garbage_rejected)
+
     def t_multi_turn_media():
         r = post(body(model="echo-image", messages=[
             {"role": "user", "content": [{"type": "text", "text": "first"}]},

@@ -129,6 +129,27 @@ def _reasoning_or_text(message: dict) -> str:
     return (message.get("content") or message.get("reasoning") or "").strip()
 
 
+def _decode_base64(data: str, what: str) -> bytes:
+    """Strictly decode base64, tolerating surrounding whitespace.
+
+    `base64.b64decode(..., validate=False)` silently DROPS characters outside
+    the alphabet, so a value like "!!!!" decodes to b"" instead of failing --
+    which would quietly forward an empty media part upstream. Whitespace is
+    stripped first (line-wrapped base64 is legitimate), everything else must be
+    real base64 that decodes to at least one byte.
+    """
+    compact = "".join(str(data).split())
+    if not compact:
+        raise ValueError(f"{what} is empty")
+    try:
+        blob = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"{what} is not valid base64") from exc
+    if not blob:
+        raise ValueError(f"{what} decoded to zero bytes")
+    return blob
+
+
 def parse_data_uri(url: str) -> Optional[Tuple[str, bytes]]:
     """Split a `data:<mime>;base64,<payload>` URI into (mime, bytes)."""
     if not isinstance(url, str) or not url.startswith("data:"):
@@ -146,8 +167,8 @@ def parse_data_uri(url: str) -> Optional[Tuple[str, bytes]]:
             return None
     mime = header.split(";")[0].strip() or "application/octet-stream"
     try:
-        return mime, base64.b64decode(payload, validate=False)
-    except (binascii.Error, ValueError):
+        return mime, _decode_base64(payload, "data URI payload")
+    except ValueError:
         return None
 
 
@@ -346,10 +367,9 @@ async def _content_parts(content: Any, client: httpx.AsyncClient) -> List[Dict[s
                     "wav": "audio/wav", "mp3": "audio/mp3",
                     "ogg": "audio/ogg", "flac": "audio/flac",
                 }.get(str(fmt).lower(), "audio/wav")
-                try:
-                    blob = base64.b64decode(data, validate=False)
-                except (binascii.Error, ValueError) as exc:
-                    raise ValueError("input_audio data is not valid base64") from exc
+                # Bare base64 (not a data URI): decode strictly, or an empty
+                # media part would be forwarded upstream without complaint.
+                blob = _decode_base64(data, "input_audio data")
             parts.append({"inline_data": {
                 "mime_type": mime,
                 "data": base64.b64encode(blob).decode("ascii"),
