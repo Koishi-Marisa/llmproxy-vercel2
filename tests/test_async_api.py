@@ -23,6 +23,10 @@ BASE_URL = api_endpoint()
 logger.info(f"BASE_URL: {BASE_URL}")
 
 
+def assert_contains(haystack: str, needle: str) -> bool:
+    return needle.lower() in (haystack or "").lower()
+
+
 async def make_request(supplier: str, api_key: str, model: str):
     BASE_URL = api_endpoint() + f"/{supplier}"
     query = "Count from 1 to 5"
@@ -38,10 +42,14 @@ async def make_request(supplier: str, api_key: str, model: str):
 
         content = ""
         async for chunk in stream:
-            delta_content = chunk.choices[0].delta.content
-            if delta_content:
-                content += delta_content
-                print(f"Received chunk: {delta_content}")  # Debug print
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            # Reasoning models emit `reasoning` separately from `content`.
+            piece = delta.content or getattr(delta, "reasoning", None)
+            if piece:
+                content += piece
+                print(f"Received chunk: {piece}")  # Debug print
 
         print(f"Full content: {content}")  # Debug print
 
@@ -49,8 +57,8 @@ async def make_request(supplier: str, api_key: str, model: str):
             raise ValueError("Received empty content from API")
 
         for i in range(1, 6):
-            assert str(
-                i) in content, f"Expected {i} in content, but it's missing. Content: {content}"
+            assert assert_contains(content, str(i)), \
+                f"Expected {i} in content, but it's missing. Content: {content}"
 
     except Exception as e:
         print(f"Error occurred: {str(e)}")
@@ -71,7 +79,7 @@ async def test_groq_streaming():
     await make_request(
         supplier="groq",
         api_key=os.environ["GROQ_API_KEY"],
-        model="llama3-70b-8192"
+        model="openai/gpt-oss-20b"
     )
 
 

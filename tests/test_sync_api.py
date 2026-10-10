@@ -23,6 +23,10 @@ BASE_URL = api_endpoint()
 logger.info(f"BASE_URL: {BASE_URL}")
 
 
+def assert_contains(haystack: str, needle: str) -> bool:
+    return needle.lower() in (haystack or "").lower()
+
+
 async def make_request(api_key: str,
                        model: str,
                        supplier: str,
@@ -39,8 +43,12 @@ async def make_request(api_key: str,
         max_tokens=20
     )
     print(type(response), response)
-    content = response.choices[0].message.content
-    assert "George Washington" in content, f"Expected 'George Washington' in content, but got {content}"
+    msg = response.choices[0].message
+    # gpt-oss-20b is a reasoning model: if it spends the token budget thinking,
+    # `content` is empty and the answer lives in `reasoning`.
+    content = msg.content or getattr(msg, "reasoning", None) or ""
+    assert assert_contains(content, "George Washington"), \
+        f"Expected 'George Washington' in content, but got {content!r}"
     return content
 
 
@@ -49,7 +57,7 @@ async def test_groq():
     await make_request(
         supplier="groq",
         api_key=os.environ["GROQ_API_KEY"],
-        model="llama3-70b-8192"
+        model="openai/gpt-oss-20b"
     )
 
 

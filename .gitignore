@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local verification harness (contains a machine-specific proxy bypass)
+verify_proxy.py
+run_local_proxy_test.py
+
+# Secrets
+.env
+.env.*
+
+# Tooling
+.pytest_cache/
+.vercel
+.DS_Store
