@@ -27,6 +27,7 @@
 - 支持供应商：Groq、Google、OpenAI、Cerebras、NVIDIA、Mistral、Sambanova
 - 支持流式输出
 - 兼容 OpenAI API 规范
+- Gemini 支持原生 Grounding with Google Search（服务端检索 + 引用返回），并提供原生 `generateContent` API 透传
 
 注：大陆不可直接访问 vercel.app 域名。如想直接访问，可参考之前作者的另一个项目[llmproxy](https://github.com/ultrasev/llmproxy)，通过 cloudflare worker 部署 LLM API 反向代理。
 
@@ -73,6 +74,31 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
+## Gemini 搜索接地（Grounding with Google Search）
+
+检索由 Google 服务端完成，模型直接带着检索结果和引用作答，调用方无需本地 `web_search`，也不会有 `tool_calls` 往返。
+
+**方式一（推荐）：原生 API 透传** —— 请求体原样转发到 Google，响应原样返回，`candidates[0].groundingMetadata` 完整保留：
+
+```bash
+curl "$BASE/v1beta/models/gemini-3.5-flash-lite:generateContent" \
+  -H "x-goog-api-key: $GEMINI_KEY" -H 'Content-Type: application/json' \
+  -d '{"contents":[{"parts":[{"text":"今天有什么重要的科技新闻？"}]}],"tools":[{"google_search":{}}]}'
+```
+
+鉴权可用 `x-goog-api-key`、`Authorization: Bearer <key>`、`x-api-key` 或 `?key=`。另有 `:streamGenerateContent` 与 `GET /v1beta/models`（`GET /models` 亦可）。不带 `tools` 的同一问题不会返回 `groundingMetadata`。
+
+**方式二：OpenAI 兼容层** —— 在 `/chat/completions` 里照常传 `"tools": [{"google_search": {}}]`（也接受 `{"type":"google_search","google_search":{}}`）。引用以两种形式**同时**返回：
+
+- `choices[0].message.content` 末尾追加 markdown 链接来源列表；
+- `choices[0].message.grounding_metadata` = Google 原始 `webSearchQueries` / `groundingChunks` / `groundingSupports`。
+
+流式同样可用：最终 delta 携带 `grounding_metadata`，并把来源列表作为一段 content 追加。
+
+**支持模型与额度**：Grounding with Google Search 仅 Gemini 3 及更新模型可用（本仓库生产环境用 `gemini-3.5-flash-lite`）。只走 Google 免费额度，免费档按模型有 RPM/RPD 限制；超限时 Google 返回 429/4xx，代理**原样透传**该状态（原生路径）或返回上游错误体（OpenAI 层），不会静默降级成「不搜」。
+
+**不支持的输入必须报错**：代理不再静默忽略工具。无法翻译的工具返回 400；已知不支持接地的模型（`gemini-1.5-*` / `gemini-2.x`）在要求 `google_search` 时同样返回 400。
 
 ## 示例 3： Cerebras
 

@@ -14,6 +14,7 @@ errors, blocked prompts, multimodal input and function calling:
     trigger-error     400 with INVALID_ARGUMENT
     trigger-blocked   200 with no candidates (promptFeedback.blockReason)
     any model + :streamGenerateContent -> streamed response
+    any model + tools:[{"google_search":{}}] -> adds candidates[0].groundingMetadata
 
 The last request body is written to mock_gemini_last_request.json so a test can
 assert on exactly what the proxy forwarded upstream.
@@ -54,10 +55,41 @@ def first_declaration(payload):
     return None
 
 
+def has_google_search(payload):
+    """True when the request asked for Grounding with Google Search."""
+    for block in payload.get("tools") or []:
+        if isinstance(block, dict) and isinstance(block.get("google_search"), dict):
+            return True
+    return False
+
+
+# Canned grounding result, shaped exactly like Google's real one.
+GROUNDING = {
+    "webSearchQueries": ["今天科技新闻 2026-10-16"],
+    "groundingChunks": [
+        {"web": {"uri": "https://example.com/news/ai-chip", "title": "AI chip news"}},
+        {"web": {"uri": "https://example.com/news/quantum", "title": "Quantum news"}},
+    ],
+    "groundingSupports": [
+        {"segment": {"startIndex": 0, "endIndex": 5}, "groundingChunkIndices": [0, 1]},
+    ],
+}
+
+
 def _frame(obj):
     """One streaming frame; Google separates them with newlines and the proxy
     parses the stream line by line."""
     return json.dumps(obj, ensure_ascii=False) + "\n"
+
+
+@app.get("/v1beta/models")
+async def list_models():
+    """Minimal ListModels reply, for the proxy's model-listing route."""
+    return JSONResponse(status_code=200, content={"models": [
+        {"name": "models/gemini-3.5-flash-lite",
+         "displayName": "Gemini 3.5 Flash Lite",
+         "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]},
+    ]})
 
 
 @app.post("/v1beta/models/{model_action}")
@@ -89,6 +121,11 @@ async def generate(model_action: str, request: Request):
         })
 
     usage = {"promptTokenCount": 5, "candidatesTokenCount": 3, "totalTokenCount": 8}
+
+    # A grounding result is only produced when the request actually asked for
+    # one -- that is what makes the "with tools" vs "without tools" contrast
+    # meaningful in the tests.
+    grounding = GROUNDING if has_google_search(payload) else None
 
     # ---- decide what the "model" replies -----------------------------------
     # Each branch only builds the reply *parts*. Serialising them for a
@@ -124,6 +161,9 @@ async def generate(model_action: str, request: Request):
     if action == "streamGenerateContent":
 
         def gen():
+            if grounding:
+                yield _frame({"candidates": [{"content": {"role": "model", "parts": []},
+                                              "groundingMetadata": grounding}]})
             if model == "trigger-tools":
                 # Gemini streams cumulative args, so send growing prefixes and
                 # repeat the same args, plus one text part first.
@@ -148,11 +188,14 @@ async def generate(model_action: str, request: Request):
 
         return StreamingResponse(gen(), media_type="application/json")
 
+    candidate = {
+        "content": {"role": "model", "parts": parts},
+        "finishReason": "STOP",
+    }
+    if grounding:
+        candidate["groundingMetadata"] = grounding
     return JSONResponse(status_code=200, content={
-        "candidates": [{
-            "content": {"role": "model", "parts": parts},
-            "finishReason": "STOP",
-        }],
+        "candidates": [candidate],
         "usageMetadata": usage,
     })
 

@@ -14,17 +14,23 @@ REST shape, then translates the reply back. Supported beyond plain text:
 * function calling - `tools` -> `functionDeclarations`, `tool_choice` ->
   `toolConfig`, assistant `tool_calls` -> `functionCall` parts, `role: "tool"`
   -> `functionResponse` parts, and back again for both streaming and not
+* grounding with Google Search - `tools: [{"google_search": {}}]` is forwarded
+  to Google, and the reply's sources come back both as markdown links appended
+  to `message.content` and as raw `message.grounding_metadata`. The native
+  `/v1beta/models/{model}:generateContent` route relays Gemini's own protocol
+  unchanged for callers that would rather not use the OpenAI shape at all.
 '''
 from loguru import logger
 from pydantic import BaseModel
-from fastapi import APIRouter, HTTPException, Header, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, HTTPException, Header, Query, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 import base64
 import binascii
 import httpx
+import re
 import typing
 from typing import Any, Dict, List, Optional, Tuple
-from .base import Message, parse_api_key
+from .base import Message, parse_api_key, redact
 import os
 import time
 import json
@@ -274,32 +280,114 @@ def _function_declaration(tool: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return declaration
 
 
-def build_tools(tools: Optional[List[Dict[str, Any]]],
-                tool_choice: Any) -> Optional[Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]]:
-    """Return (tools, toolConfig) for Gemini, or None when tools are unused."""
+def _is_google_search_tool(tool: Any) -> bool:
+    """True for a Grounding-with-Google-Search tool, in either spelling.
+
+    Both the native form `{"google_search": {}}` and the OpenAI-ish tagged form
+    `{"type": "google_search", "google_search": {}}` are accepted. Passing one
+    of them through unchanged is exactly what makes Google search server-side.
+    """
+    if not isinstance(tool, dict):
+        return False
+    if isinstance(tool.get("google_search"), dict):
+        return True
+    return str(tool.get("type") or "").strip().lower() in (
+        "google_search", "google_search_retrieval")
+
+
+def _payload_has_google_search(payload: Any) -> bool:
+    """True when a raw request body asks for Grounding with Google Search."""
+    if not isinstance(payload, dict):
+        return False
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return False
+    return any(_is_google_search_tool(tool) for tool in tools)
+
+
+def grounding_support(model: Any) -> Optional[bool]:
+    """Whether `model` can use Grounding with Google Search.
+
+    True/False when the family is recognised, None when it is not -- an unknown
+    name is left for Google to judge rather than being rejected here. Grounding
+    with Google Search first shipped with the Gemini 3 family, so `gemini-1.5-*`
+    and `gemini-2.x` are known to be unsupported.
+    """
+    if not isinstance(model, str):
+        return None
+    match = re.search(r"gemini[-_]?(\d+)", model.strip().lower())
+    if not match:
+        return None
+    return int(match.group(1)) >= 3
+
+
+def build_tools(tools: Optional[List[Dict[str, Any]]], tool_choice: Any
+                ) -> Optional[Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], bool]]:
+    """Return (tools, toolConfig, uses_grounding) for Gemini, or None if unused.
+
+    Raises ValueError for a tool this proxy cannot honour. Returning None for a
+    request that *did* carry tools used to make the caller believe the tool ran
+    (e.g. that a web search happened) while the model answered from memory --
+    the worst possible failure mode -- so anything untranslatable is now an
+    explicit 400 instead.
+    """
     if not tools:
         return None
-    declarations = [d for d in (_function_declaration(t) for t in tools) if d]
-    if not declarations:
-        return None
 
+    declarations: List[Dict[str, Any]] = []
+    uses_grounding = False
+    unusable: List[str] = []
+    for tool in tools:
+        if _is_google_search_tool(tool):
+            uses_grounding = True
+            continue
+        declaration = _function_declaration(tool)
+        if declaration:
+            declarations.append(declaration)
+            continue
+        if isinstance(tool, dict):
+            fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            label = (fn.get("name") if isinstance(fn, dict) else None) or tool.get("type")
+        else:
+            label = None
+        unusable.append(str(label) if label else json.dumps(tool, ensure_ascii=False)[:80])
+
+    if unusable:
+        raise ValueError(
+            "unsupported tool(s): " + ", ".join(unusable)
+            + ". This proxy translates OpenAI 'function' tools and "
+              '\'{"google_search": {}}\' (Grounding with Google Search); '
+              "anything else is rejected rather than silently dropped."
+        )
+
+    # tool_choice=none disables function calling, but it must NOT switch
+    # grounding off: a caller that asked for search still gets search.
     if isinstance(tool_choice, str) and tool_choice.lower() == "none":
+        declarations = []
+
+    gemini_tools: List[Dict[str, Any]] = []
+    if declarations:
+        gemini_tools.append({"functionDeclarations": declarations})
+    if uses_grounding:
+        gemini_tools.append({"google_search": {}})
+    if not gemini_tools:
         return None
 
     tool_config: Optional[Dict[str, Any]] = None
-    if isinstance(tool_choice, str):
-        mode = {"auto": "AUTO", "required": "ANY", "any": "ANY"}.get(tool_choice.lower())
-        if mode:
-            tool_config = {"functionCallingConfig": {"mode": mode}}
-    elif isinstance(tool_choice, dict):
-        chosen = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else tool_choice
-        name = chosen.get("name") if isinstance(chosen, dict) else None
-        if name:
-            tool_config = {"functionCallingConfig": {
-                "mode": "ANY",
-                "allowedFunctionNames": [name],
-            }}
-    return [{"functionDeclarations": declarations}], tool_config
+    if declarations:
+        if isinstance(tool_choice, str):
+            mode = {"auto": "AUTO", "required": "ANY", "any": "ANY"}.get(tool_choice.lower())
+            if mode:
+                tool_config = {"functionCallingConfig": {"mode": mode}}
+        elif isinstance(tool_choice, dict):
+            chosen = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else tool_choice
+            name = chosen.get("name") if isinstance(chosen, dict) else None
+            if name:
+                tool_config = {"functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": [name],
+                }}
+    return gemini_tools, tool_config, uses_grounding
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +650,35 @@ def parse_response_parts(candidate: Dict[str, Any]) -> Tuple[str, List[Dict[str,
     return "".join(text_chunks), tool_calls
 
 
+def _grounding_markdown(metadata: Optional[Dict[str, Any]]) -> str:
+    """Render Google's grounding sources as markdown links.
+
+    This is the human-visible half of the grounding result: the caller's model
+    text gets a short reference list appended, so a bot can show where an answer
+    came from without parsing `grounding_metadata` itself.
+    """
+    if not isinstance(metadata, dict):
+        return ""
+    lines: List[str] = []
+    seen = set()
+    for chunk in metadata.get("groundingChunks") or []:
+        web = chunk.get("web") if isinstance(chunk, dict) else None
+        if not isinstance(web, dict):
+            continue
+        uri = web.get("uri")
+        if not isinstance(uri, str) or not uri or uri in seen:
+            continue
+        seen.add(uri)
+        title = web.get("title") if isinstance(web.get("title"), str) and web.get("title") else uri
+        lines.append(f"- [{title}]({uri})")
+    if lines:
+        return "\n\n---\n参考来源：\n" + "\n".join(lines)
+    queries = [q for q in (metadata.get("webSearchQueries") or []) if isinstance(q, str) and q]
+    if queries:
+        return "\n\n---\n参考来源（服务端检索关键词）：" + "、".join(queries)
+    return ""
+
+
 def convert_gemini_to_openai_response(gemini_response: dict, model: str) -> dict:
     """Convert a Gemini `generateContent` reply to an OpenAI completion."""
     candidates = gemini_response.get("candidates") or [{}]
@@ -582,6 +699,17 @@ def convert_gemini_to_openai_response(gemini_response: dict, model: str) -> dict
     message: Dict[str, Any] = {"role": "assistant", "content": text}
     if tool_calls:
         message["tool_calls"] = tool_calls
+
+    grounding = candidate.get("groundingMetadata")
+    if isinstance(grounding, dict) and grounding:
+        # Grounding is exposed in BOTH forms: sources appended to `content` as
+        # markdown links (works with any OpenAI client) and the raw metadata on
+        # the non-standard `grounding_metadata` field (for callers that want
+        # webSearchQueries / groundingSupports verbatim).
+        suffix = _grounding_markdown(grounding)
+        if suffix:
+            message["content"] = (text + suffix) if text else suffix.lstrip("\n")
+        message["grounding_metadata"] = grounding
 
     return {
         "id": f"chatcmpl-{int(time.time() * 1000)}",
@@ -651,6 +779,7 @@ async def stream_gemini_response(model: str, payload: dict, api_key: str,
     # Gemini orders parallel calls; an explicit `index`, if ever present, wins.
     slots: List[Dict[str, Any]] = []
     last_usage: Dict[str, int] = _usage_from(None)
+    last_grounding: Optional[Dict[str, Any]] = None
 
     async with httpx.AsyncClient() as client:
         async with client.stream(
@@ -688,6 +817,8 @@ async def stream_gemini_response(model: str, payload: dict, api_key: str,
                     last_usage = _usage_from(obj["usageMetadata"])
 
                 for candidate in obj.get("candidates", []):
+                    if isinstance(candidate.get("groundingMetadata"), dict):
+                        last_grounding = candidate["groundingMetadata"]
                     position = 0
                     for part in _parts_of(candidate):
                         if not isinstance(part, dict):
@@ -757,6 +888,15 @@ async def stream_gemini_response(model: str, payload: dict, api_key: str,
             }]})
             slot["sent"] = final
 
+    # Grounding arrives mid-stream; emit it once at the end, as a content delta
+    # (the markdown sources) plus the raw metadata on the non-standard field.
+    if last_grounding:
+        grounding_delta: Dict[str, Any] = {"grounding_metadata": last_grounding}
+        suffix = _grounding_markdown(last_grounding)
+        if suffix:
+            grounding_delta["content"] = suffix
+        yield _chunk(model, grounding_delta)
+
     finish_reason = "tool_calls" if slots else "stop"
     yield _chunk(model, {}, finish_reason, usage=last_usage if include_usage else None)
     yield "data: [DONE]\n\n"
@@ -821,9 +961,23 @@ async def proxy_chat_completions(
     if system_instruction:
         gemini_payload["systemInstruction"] = system_instruction
 
-    built_tools = build_tools(args.tools, args.tool_choice)
+    try:
+        built_tools = build_tools(args.tools, args.tool_choice)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if built_tools:
-        tools, tool_config = built_tools
+        tools, tool_config, uses_grounding = built_tools
+        if uses_grounding and grounding_support(model) is False:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"model '{model}' does not support Grounding with Google "
+                    "Search; it is only available on Gemini 3 and newer models. "
+                    "Use a Gemini 3+ model (e.g. gemini-3.5-flash-lite) or remove "
+                    "'{\"google_search\": {}}'. The request is rejected rather "
+                    "than answered without the search that was asked for."
+                ),
+            )
         gemini_payload["tools"] = tools
         if tool_config:
             gemini_payload["toolConfig"] = tool_config
@@ -866,3 +1020,178 @@ async def proxy_chat_completions(
             openai_compatible_response = convert_gemini_to_openai_response(body, args.model)
 
             return JSONResponse(openai_compatible_response)
+
+
+# ---------------------------------------------------------------------------
+# Native Gemini passthrough
+#
+# The OpenAI-compatible route above is a translation layer, so anything it does
+# not understand has to be re-implemented there. Grounding with Google Search is
+# better served by speaking Gemini's own protocol: the caller's body (including
+# `tools: [{"google_search": {}}]`) is relayed byte-for-byte and Google's reply
+# -- `candidates[0].groundingMetadata` and all -- comes back untouched. That
+# removes the whole class of "the proxy quietly dropped the feature" bugs.
+# ---------------------------------------------------------------------------
+
+NATIVE_TIMEOUT = httpx.Timeout(
+    connect=_env_int("GEMINI_CONNECT_TIMEOUT", 15),
+    read=_env_int("GEMINI_READ_TIMEOUT", 300),
+    write=60,
+    pool=15,
+)
+
+
+def _native_credentials(request: Request, x_goog_api_key: Optional[str],
+                        x_api_key: Optional[str]) -> str:
+    """Read the caller's key wherever the native protocol happens to put it.
+
+    Accepts `x-goog-api-key`, `?key=`, `x-api-key` and `Authorization: Bearer`.
+    The proxy only relays the value to Google; it is never echoed to the client
+    and never written to logs.
+    """
+    for candidate in (x_goog_api_key, request.query_params.get("key"), x_api_key):
+        if candidate and candidate.strip():
+            return candidate.strip()
+    try:
+        return parse_api_key(request.headers.get("authorization"), None)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=(f"{exc}. Send 'x-goog-api-key: <gemini api key>' or "
+                    "'Authorization: Bearer <gemini api key>'."),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _forward_query(request: Request) -> List[Tuple[str, str]]:
+    """Relay the query string, minus `key`, which becomes a request header."""
+    return [(k, v) for k, v in request.query_params.multi_items() if k != "key"]
+
+
+def _native_headers(api_key: str) -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "x-goog-api-key": api_key,
+        "User-Agent": "llmproxy-vercel/1.0",
+    }
+
+
+@router.post("/v1beta/models/{model_action}")
+async def gemini_native_generate(
+    model_action: str,
+    request: Request,
+    x_goog_api_key: str = Header(None, alias="x-goog-api-key"),
+    x_api_key: str = Header(None, alias="x-api-key"),
+):
+    """Relay `:generateContent` / `:streamGenerateContent` to Google unchanged.
+
+    Example body (the tools entry is what turns on server-side search):
+
+        {"contents": [{"parts": [{"text": "..."}]}],
+         "tools": [{"google_search": {}}]}
+    """
+    api_key = _native_credentials(request, x_goog_api_key, x_api_key)
+    model = model_action.split(":")[0]
+    action = model_action.split(":")[1] if ":" in model_action else "generateContent"
+    is_stream = action == "streamGenerateContent"
+
+    raw = await request.body()
+
+    # Native bodies are forwarded verbatim, but a model that is known not to
+    # support search grounding must fail loudly here rather than be answered
+    # without the search the caller explicitly asked for.
+    try:
+        parsed_body = json.loads(raw) if raw.strip() else {}
+    except (json.JSONDecodeError, ValueError):
+        parsed_body = None
+    if _payload_has_google_search(parsed_body) and grounding_support(model) is False:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"model '{model}' does not support Grounding with Google "
+                "Search; it is only available on Gemini 3 and newer models."
+            ),
+        )
+
+    url = f"{GEMINI_API_BASE}/v1beta/models/{model_action}"
+    params = _forward_query(request)
+    headers = _native_headers(api_key)
+
+    if not is_stream:
+        async with httpx.AsyncClient(timeout=NATIVE_TIMEOUT, follow_redirects=True) as client:
+            try:
+                response = await client.post(url, params=params, content=raw, headers=headers)
+            except httpx.HTTPError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Upstream request failed: {redact(str(exc), api_key)}",
+                )
+        return Response(
+            content=redact(response.content.decode("utf-8", "replace"), api_key),
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type", "application/json"),
+        )
+
+    # Streaming: the upstream status must still be readable, because a
+    # StreamingResponse commits to 200 before the first chunk is produced.
+    client = httpx.AsyncClient(timeout=NATIVE_TIMEOUT, follow_redirects=True)
+    try:
+        upstream_request = client.build_request(
+            "POST", url, params=params, content=raw, headers=headers)
+        response = await client.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Upstream request failed: {redact(str(exc), api_key)}",
+        )
+
+    if response.status_code != 200:
+        body = redact((await response.aread()).decode("utf-8", "replace"), api_key)
+        media_type = response.headers.get("content-type", "application/json")
+        await response.aclose()
+        await client.aclose()
+        return Response(content=body, status_code=response.status_code, media_type=media_type)
+
+    media_type = response.headers.get("content-type", "text/event-stream")
+
+    async def relay():
+        try:
+            async for chunk in response.aiter_raw():
+                if chunk:
+                    yield chunk
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return StreamingResponse(relay(), media_type=media_type)
+
+
+@router.get("/v1beta/models")
+@router.get("/models")
+async def gemini_native_list_models(
+    request: Request,
+    x_goog_api_key: str = Header(None, alias="x-goog-api-key"),
+    x_api_key: str = Header(None, alias="x-api-key"),
+):
+    """List Google's models, so a caller can discover grounding-capable ones."""
+    api_key = _native_credentials(request, x_goog_api_key, x_api_key)
+    async with httpx.AsyncClient(timeout=NATIVE_TIMEOUT, follow_redirects=True) as client:
+        try:
+            response = await client.get(
+                f"{GEMINI_API_BASE}/v1beta/models",
+                params=_forward_query(request),
+                headers={"Accept": "application/json", "x-goog-api-key": api_key,
+                         "User-Agent": "llmproxy-vercel/1.0"},
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream request failed: {redact(str(exc), api_key)}",
+            )
+    return Response(
+        content=redact(response.content.decode("utf-8", "replace"), api_key),
+        status_code=response.status_code,
+        media_type=response.headers.get("content-type", "application/json"),
+    )
