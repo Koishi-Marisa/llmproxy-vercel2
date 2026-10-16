@@ -7,11 +7,13 @@ response, and handles errors. Run with the local uvicorn server on port 8125.
     python test_gemini_mock.py http://127.0.0.1:8125
 """
 import json
+import os
 import sys
 
 import httpx
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8125").rstrip("/")
+MOCK_BASE = os.environ.get("MOCK_GEMINI_BASE", "http://127.0.0.1:8126").rstrip("/")
 HDR = {"Authorization": "Bearer AIza_fake_key", "Content-Type": "application/json"}
 LAST_REQUEST = "mock_gemini_last_request.json"
 
@@ -400,6 +402,51 @@ def t_openai_grounding_stream():
 
 
 check("openai route: streaming grounding -> sources + metadata", t_openai_grounding_stream)
+
+
+print("\n--- credentials + upstream resilience ---")
+
+
+def t_chat_accepts_x_goog_api_key():
+    """The documented auth (`x-goog-api-key`) must work on the OpenAI route too,
+    not only on the native one."""
+    r = httpx.post(f"{BASE}/gemini/chat/completions",
+                   headers={"x-goog-api-key": "AIza_header_key",
+                            "Content-Type": "application/json"},
+                   json=body(), timeout=60)
+    assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:200]}"
+    with open(LAST_REQUEST, encoding="utf-8") as fh:
+        sent = json.load(fh)
+    assert sent["api_key"] == "AIza_header_key", sent["api_key"]
+
+
+check("chat route accepts x-goog-api-key", t_chat_accepts_x_goog_api_key)
+
+
+def t_upstream_retry_on_5xx():
+    """A single transient 500 must be retried, not surfaced to the caller."""
+    try:
+        httpx.get(f"{MOCK_BASE}/reset_flaky", timeout=5)
+    except Exception:  # noqa: BLE001 - mock not directly reachable is fine
+        pass
+    r = httpx.post(f"{BASE}/gemini/chat/completions", headers=HDR, timeout=60,
+                   json=body(model="trigger-flaky"))
+    assert r.status_code == 200, f"expected the retry to succeed, got {r.status_code}: {r.text[:200]}"
+    assert r.json()["choices"][0]["message"]["content"] == "MOCK_REPLY", r.json()
+
+
+check("transient upstream 500 -> retried -> 200", t_upstream_retry_on_5xx)
+
+
+def t_upstream_4xx_not_retried():
+    """4xx (incl. quota 429) must be passed through immediately, no retry."""
+    r = httpx.post(f"{BASE}/gemini/chat/completions", headers=HDR, timeout=60,
+                   json=body(model="trigger-error"))
+    assert r.status_code == 400, f"expected 400, got {r.status_code}"
+    assert "API key not valid" in r.text, r.text[:200]
+
+
+check("upstream 4xx passed through (not retried)", t_upstream_4xx_not_retried)
 
 
 print("\n--- model listing ---")

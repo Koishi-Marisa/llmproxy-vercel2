@@ -13,6 +13,7 @@ errors, blocked prompts, multimodal input and function calling:
     trigger-tools     returns a functionCall for the first declared function
     trigger-error     400 with INVALID_ARGUMENT
     trigger-blocked   200 with no candidates (promptFeedback.blockReason)
+    trigger-flaky     one transient 500 per distinct request, then 200
     any model + :streamGenerateContent -> streamed response
     any model + tools:[{"google_search":{}}] -> adds candidates[0].groundingMetadata
 
@@ -30,6 +31,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI()
 LAST_REQUEST_PATH = "mock_gemini_last_request.json"
+# Payload signatures already served, used by the `trigger-flaky` model: it
+# fails the first time a given request is seen and succeeds on the retry.
+SEEN_PAYLOADS = set()
 
 
 def total_parts(payload):
@@ -82,6 +86,13 @@ def _frame(obj):
     return json.dumps(obj, ensure_ascii=False) + "\n"
 
 
+@app.get("/reset_flaky")
+async def reset_flaky():
+    """Make the next `trigger-flaky` request fail again (test determinism)."""
+    SEEN_PAYLOADS.clear()
+    return {"cleared": True}
+
+
 @app.get("/v1beta/models")
 async def list_models():
     """Minimal ListModels reply, for the proxy's model-listing route."""
@@ -119,6 +130,16 @@ async def generate(model_action: str, request: Request):
             "promptFeedback": {"blockReason": "SAFETY"},
             "usageMetadata": {"promptTokenCount": 7},
         })
+
+    if model == "trigger-flaky":
+        # One transient 500 per distinct request, then a normal reply. A proxy
+        # that retries 5xx gets a 200; one that does not surfaces the 500.
+        signature = json.dumps([model, payload], sort_keys=True, ensure_ascii=False)
+        if signature not in SEEN_PAYLOADS:
+            SEEN_PAYLOADS.add(signature)
+            return JSONResponse(status_code=500, content={
+                "error": {"code": 500, "message": "Transient upstream failure.",
+                          "status": "INTERNAL"}})
 
     usage = {"promptTokenCount": 5, "candidatesTokenCount": 3, "totalTokenCount": 8}
 

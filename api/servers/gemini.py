@@ -24,6 +24,7 @@ from loguru import logger
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+import asyncio
 import base64
 import binascii
 import httpx
@@ -61,6 +62,40 @@ MEDIA_FETCH_TIMEOUT = httpx.Timeout(
     write=30,
     pool=10,
 )
+
+# Google's upstream blips (transient 5xx / dropped connections) are common
+# enough that one bounded retry stops a single hiccup from knocking the caller's
+# multi-upstream chain down to a weaker model. 4xx is never retried, so a quota
+# 429 or a validation error is reported at once instead of burning attempts.
+UPSTREAM_ATTEMPTS = max(1, _env_int("GEMINI_UPSTREAM_ATTEMPTS", 2))
+UPSTREAM_RETRY_BACKOFF = 0.4
+
+
+async def _post_upstream(client: httpx.AsyncClient, url: str, *,
+                         headers: Dict[str, str],
+                         json_body: Optional[Dict[str, Any]] = None,
+                         content: Optional[bytes] = None,
+                         params: Optional[List[Tuple[str, str]]] = None) -> httpx.Response:
+    """POST to Google, retrying only transient failures.
+
+    Retried: transport errors and 5xx. Not retried: 4xx, so rate limits and
+    validation errors surface to the caller immediately.
+    """
+    last_error: Optional[httpx.HTTPError] = None
+    for attempt in range(UPSTREAM_ATTEMPTS):
+        try:
+            response = await client.post(url, json=json_body, content=content,
+                                         headers=headers, params=params)
+        except httpx.HTTPError as exc:
+            last_error = exc
+        else:
+            if response.status_code < 500 or attempt == UPSTREAM_ATTEMPTS - 1:
+                return response
+        if attempt < UPSTREAM_ATTEMPTS - 1:
+            await asyncio.sleep(UPSTREAM_RETRY_BACKOFF)
+    assert last_error is not None
+    raise last_error
+
 
 # JSON Schema keywords Gemini's Schema object does not accept. Sending any of
 # them makes the whole request fail, so the tool schema is pruned to the subset
@@ -907,15 +942,23 @@ async def proxy_chat_completions(
     args: OpenAIProxyArgs,
     authorization: str = Header(None),
     x_api_key: str = Header(None, alias="x-api-key"),
+    x_goog_api_key: str = Header(None, alias="x-goog-api-key"),
 ):
     # `authorization.split(" ")[1]` used to raise IndexError -> HTTP 500 for
     # any header without a space (e.g. a bare token or "Basic ...").
+    #
+    # This single credential is what every branch below -- including the
+    # `google_search` grounding branch -- forwards to Google. There is no
+    # separate server-side Google key in this deployment, so the caller's key is
+    # the upstream key, resolved once here so no branch can pick up a different
+    # one.
     try:
-        api_key = parse_api_key(authorization, x_api_key)
+        api_key = parse_api_key(authorization, x_goog_api_key or x_api_key)
     except ValueError as exc:
         raise HTTPException(
             status_code=401,
-            detail=f"{exc}. Send 'Authorization: Bearer <your gemini api key>'.",
+            detail=(f"{exc}. Send 'x-goog-api-key: <your gemini api key>' or "
+                    "'Authorization: Bearer <your gemini api key>'."),
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -990,13 +1033,14 @@ async def proxy_chat_completions(
         )
     else:
         async with httpx.AsyncClient() as client:
-            response = await client.post(
+            response = await _post_upstream(
+                client,
                 GEMINI_ENDPOINT.format(model),
-                json=gemini_payload,
+                json_body=gemini_payload,
                 headers={
                     "Content-Type": "application/json",
                     "x-goog-api-key": api_key
-                }
+                },
             )
 
             try:
@@ -1121,7 +1165,8 @@ async def gemini_native_generate(
     if not is_stream:
         async with httpx.AsyncClient(timeout=NATIVE_TIMEOUT, follow_redirects=True) as client:
             try:
-                response = await client.post(url, params=params, content=raw, headers=headers)
+                response = await _post_upstream(client, url, params=params,
+                                               content=raw, headers=headers)
             except httpx.HTTPError as exc:
                 raise HTTPException(
                     status_code=502,

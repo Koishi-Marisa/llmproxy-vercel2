@@ -89,12 +89,14 @@ curl "$BASE/v1beta/models/gemini-3.5-flash-lite:generateContent" \
 
 鉴权可用 `x-goog-api-key`、`Authorization: Bearer <key>`、`x-api-key` 或 `?key=`。另有 `:streamGenerateContent` 与 `GET /v1beta/models`（`GET /models` 亦可）。不带 `tools` 的同一问题不会返回 `groundingMetadata`。
 
-**方式二：OpenAI 兼容层** —— 在 `/chat/completions` 里照常传 `"tools": [{"google_search": {}}]`（也接受 `{"type":"google_search","google_search":{}}`）。引用以两种形式**同时**返回：
+**方式二：OpenAI 兼容层** —— 在 `/chat/completions` 里照常传 `"tools": [{"google_search": {}}]`（也接受 `{"type":"google_search","google_search":{}}`），鉴权同样接受 `x-goog-api-key` / `Authorization: Bearer` / `x-api-key`。引用以两种形式**同时**返回：
 
 - `choices[0].message.content` 末尾追加 markdown 链接来源列表；
 - `choices[0].message.grounding_metadata` = Google 原始 `webSearchQueries` / `groundingChunks` / `groundingSupports`。
 
 流式同样可用：最终 delta 携带 `grounding_metadata`，并把来源列表作为一段 content 追加。
+
+**上游抖动**：非流式请求对 Google 的瞬时 5xx / 连接中断做一次有界重试（`GEMINI_UPSTREAM_ATTEMPTS`，默认 2），避免单次抽风就让多上游链掉到更弱的档；4xx（含额度 429）从不重试，立即原样返回。
 
 **支持模型与额度**：Grounding with Google Search 仅 Gemini 3 及更新模型可用（本仓库生产环境用 `gemini-3.5-flash-lite`）。只走 Google 免费额度，免费档按模型有 RPM/RPD 限制；超限时 Google 返回 429/4xx，代理**原样透传**该状态（原生路径）或返回上游错误体（OpenAI 层），不会静默降级成「不搜」。
 
